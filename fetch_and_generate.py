@@ -5,19 +5,18 @@ import json
 import base64
 import re
 from datetime import datetime, timedelta
-from imap_tools import MailBox, AND
+from imap_tools import MailBox, AND, OR
 from openpyxl import load_workbook
 
 # === Config ===
 EMAIL_USER = os.environ.get("EMAIL_USER", "xuehaifeng666@qq.com")
-EMAIL_AUTH = os.environ.get("EMAIL_AUTH", "ztfzkfwzzywmjdaf")  # IMAP auth code
-QQ_APP_PWD = os.environ.get("QQ_APP_PWD", "")  # QQ IMAP app password
+EMAIL_AUTH = os.environ.get("EMAIL_AUTH", "ztfzkfwzzywmjdaf")
+QQ_APP_PWD = os.environ.get("QQ_APP_PWD", "")
 
 VESSEL_LIST_FILE = "Vessel list-20260701.xlsx"
 EXCLUDE_SHIPS = {"ORE CHINA", "ORE DONGJIAKOU", "ORE HEBEI", "ORE SHANDONG"}
 
 def get_imap_password():
-    """Get IMAP password from env."""
     return QQ_APP_PWD or EMAIL_AUTH
 
 def fetch_hifleet_email():
@@ -27,12 +26,11 @@ def fetch_hifleet_email():
         raise ValueError("No IMAP password available")
     
     with MailBox("imap.qq.com").login(EMAIL_USER, password) as mailbox:
-        messages = mailbox.fetch(
-            AND(from_="hifleet.com", subject="weather", all_messages=True),
-            reverse=True, limit=1
-        )
-        for msg in messages:
-            return msg.html
+        # Search for hifleet weather emails and get latest one
+        criteria = AND(from_="hifleet.com", subject="weather")
+        messages = list(mailbox.fetch(criteria, reverse=True, limit=1))
+        if messages:
+            return messages[0].html
     return None
 
 def load_vessel_list(path):
@@ -48,10 +46,9 @@ def load_vessel_list(path):
 
 def parse_hifleet_html(html):
     """Parse HiFleet email HTML to extract ship weather data."""
-    import re
     ships_data = {}
     
-    # Find all ship blocks
+    # Find all ship blocks - match 5 TD cells in a TR
     ship_pattern = re.compile(
         r'<tr[^>]*>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*'
         r'<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*'
@@ -65,7 +62,8 @@ def parse_hifleet_html(html):
             continue
         
         forecast = row[1].strip()
-        # Parse forecast: dates and values
+        # Parse forecast: format "1d/3.5/1.5/5" or "1d/3.5/1.5"
+        # (day_offset, wind, wave, visibility)
         days = re.findall(r'(\d+m?)/(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)', forecast)
         
         ships_data[ship_name] = {
@@ -105,7 +103,6 @@ def generate_dashboard(ships_data, output_path="output/index.html"):
             if wave >= 3:
                 wave3_ships[ship].append(i + 1)
     
-    # HTML
     html = f"""<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -119,64 +116,80 @@ body {{ font-family: Arial; background: #0a0e27; color: #c8d3f5; margin: 0; padd
 .header p {{ color:#7aa2f7; opacity:0.7; margin:5px 0 0; }}
 .alert-box {{ background:#1e2340; border-left:4px solid #f7768e; padding:15px; border-radius:8px; margin-bottom:20px; }}
 .alert-box h3 {{ color:#f7768e; margin:0 0 10px; }}
-table {{ width:100%; border-collapse:collapse; background:#1e2340; border-radius:8px; overflow:hidden; }}
+table {{ width:100%; border-collapse:collapse; background:#1e2340; border-radius:8px; overflow:hidden; margin-bottom:30px; }}
 th {{ background:#7c3aed; color:#fff; padding:10px; text-align:center; }}
 td {{ padding:8px 10px; text-align:center; border-bottom:1px solid #2d3585; }}
 tr:hover {{ background:#2d3585; }}
 .wave-red {{ color:#f7768e; font-weight:bold; }}
 .wave-orange {{ color:#ff9e64; }}
+.wind-red {{ color:#f7768e; font-weight:bold; }}
 section {{ margin-bottom:30px; }}
 .ship-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:12px; }}
 .ship-card {{ background:#1e2340; border-radius:8px; padding:12px; border:1px solid #2d3585; }}
 .ship-card h4 {{ color:#7aa2f7; margin:0 0 8px; }}
-.badge {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; }}
+.badge {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; margin:2px; }}
 .badge-red {{ background:#3d2048; color:#f7768e; }}
+.badge-orange {{ background:#3d2a00; color:#ff9e64; }}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>🚢 HiFleet Weather Dashboard</h1>
-  <p>76 ships · Updated: {today} · Alert: wind>6 OR wave≥3m</p>
+  <h1>&#x1F6A2; HiFleet Weather Dashboard</h1>
+  <p>76 ships &middot; Updated: {today} &middot; Alert: wind&gt;6 OR wave&ge;3m</p>
 </div>
 
 <div class="alert-box">
-  <h3>⚠️ Today's Alerts ({len(alert_ships)} ships)</h3>
-  <table>
+  <h3>&#x26A0;&#xFE0F; Today's Alerts ({len(alert_ships)} ships)</h3>
+"""
+    if alert_ships:
+        html += """  <table>
     <tr><th>Ship</th><th>Type</th><th>Wind (m/s)</th><th>Wave (m)</th></tr>
 """
-    for s in sorted(alert_ships, key=lambda x: -x["wave"]):
-        wave_cls = "wave-red" if s["wave"] >= 3 else "wave-orange"
-        html += f'    <tr><td>{s["ship"]}</td><td>{s["type"]}</td><td>{s["wind"]}</td><td class="{wave_cls}">{s["wave"]}</td></tr>\n'
+        for s in sorted(alert_ships, key=lambda x: -x["wave"]):
+            wind_cls = "wind-red" if s["wind"] > 6 else ""
+            wave_cls = "wave-red" if s["wave"] >= 3 else "wave-orange"
+            html += f'    <tr><td>{s["ship"]}</td><td>{s["type"]}</td><td class="{wind_cls}">{s["wind"]}</td><td class="{wave_cls}">{s["wave"]}</td></tr>\n'
+        html += "  </table>\n"
+    else:
+        html += "  <p>No alerts today!</p>\n"
     
-    html += """  </table>
-</div>
+    html += """</div>
 
 <section>
-  <h2 style="color:#7aa2f7;">🌊 Ships with Wave ≥ 3m (Next 7 Days)</h2>
+  <h2 style="color:#7aa2f7;">&#x1F30A; Ships with Wave &ge; 3m (Next 7 Days)</h2>
   <div class="ship-grid">
 """
     
+    wave3_count = 0
     for ship, days in sorted(wave3_ships.items()):
         if days:
-            badges = " ".join([f'<span class="badge badge-red">Day {d}</span>' for d in days])
+            wave3_count += 1
+            day_labels = {"1": "D1", "2": "D2", "3": "D3", "4": "D4", "5": "D5", "6": "D6", "7": "D7"}
+            badges = " ".join([
+                f'<span class="badge badge-red">{day_labels.get(str(d), f"D{d}")}</span>'
+                for d in days
+            ])
             html += f'    <div class="ship-card"><h4>{ship}</h4>{badges}</div>\n'
+    
+    if wave3_count == 0:
+        html += '    <p style="color:#7aa2f7;">No ships with wave &ge; 3m in the next 7 days.</p>\n'
     
     html += """  </div>
 </section>
 
 <section>
-  <h2 style="color:#7aa2f7;">📊 Full 7-Day Forecast</h2>
+  <h2 style="color:#7aa2f7;">&#x1F4CA; Full 7-Day Forecast</h2>
   <div style="overflow-x:auto;">
   <table>
     <tr>
       <th>Ship</th><th>Type</th>
-      <th>Day 1 Wind</th><th>Day 1 Wave</th>
-      <th>Day 2 Wind</th><th>Day 2 Wave</th>
-      <th>Day 3 Wind</th><th>Day 3 Wave</th>
-      <th>Day 4 Wind</th><th>Day 4 Wave</th>
-      <th>Day 5 Wind</th><th>Day 5 Wave</th>
-      <th>Day 6 Wind</th><th>Day 6 Wave</th>
-      <th>Day 7 Wind</th><th>Day 7 Wave</th>
+      <th>D1 Wind</th><th>D1 Wave</th>
+      <th>D2 Wind</th><th>D2 Wave</th>
+      <th>D3 Wind</th><th>D3 Wave</th>
+      <th>D4 Wind</th><th>D4 Wave</th>
+      <th>D5 Wind</th><th>D5 Wave</th>
+      <th>D6 Wind</th><th>D6 Wave</th>
+      <th>D7 Wind</th><th>D7 Wave</th>
     </tr>
 """
     
@@ -188,8 +201,9 @@ section {{ margin-bottom:30px; }}
                 w = days[i]
                 wind = w[1] if w[1] else "-"
                 wave = w[2] if w[2] else "-"
+                wind_cls = "wind-red" if wind != "-" and float(wind) > 6 else ""
                 wave_cls = "wave-red" if wave != "-" and float(wave) >= 3 else ("wave-orange" if wave != "-" and float(wave) >= 2 else "")
-                row += f'<td>{wind}</td><td class="{wave_cls}">{wave}</td>'
+                row += f'<td class="{wind_cls}">{wind}</td><td class="{wave_cls}">{wave}</td>'
             else:
                 row += "<td>-</td><td>-</td>"
         row += "</tr>\n"
@@ -213,7 +227,6 @@ def main():
         with open("hifleet_weather_76ships.json") as f:
             ships_data = json.load(f)
     else:
-        # Load vessel list for filtering
         if os.path.exists(VESSEL_LIST_FILE):
             vessels = load_vessel_list(VESSEL_LIST_FILE)
             print(f"Loaded {len(vessels)} vessels from list")
