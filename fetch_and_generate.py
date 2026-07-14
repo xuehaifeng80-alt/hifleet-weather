@@ -2,53 +2,50 @@
 """Fetch HiFleet weather email and generate dashboard."""
 import os
 import json
-import base64
 import re
 from datetime import datetime, timedelta
-from imap_tools import MailBox, AND, OR
-from openpyxl import load_workbook
+from collections import defaultdict
+from imap_tools import MailBox, AND
 
 # === Config ===
 EMAIL_USER = os.environ.get("EMAIL_USER", "xuehaifeng666@qq.com")
 EMAIL_AUTH = os.environ.get("EMAIL_AUTH", "ztfzkfwzzywmjdaf")
 QQ_APP_PWD = os.environ.get("QQ_APP_PWD", "")
 
-VESSEL_LIST_FILE = "Vessel list-20260701.xlsx"
+# Ships NOT on Manus platform (excluded)
 EXCLUDE_SHIPS = {"ORE CHINA", "ORE DONGJIAKOU", "ORE HEBEI", "ORE SHANDONG"}
 
 def get_imap_password():
     return QQ_APP_PWD or EMAIL_AUTH
 
 def fetch_hifleet_email():
-    """Fetch latest HiFleet weather email from QQ Mail."""
+    """Fetch latest HiFleet weather email from QQ Mail IMAP."""
     password = get_imap_password()
     if not password:
-        raise ValueError("No IMAP password available")
+        print("No IMAP password available")
+        return None
     
-    with MailBox("imap.qq.com").login(EMAIL_USER, password) as mailbox:
-        # Search for hifleet weather emails and get latest one
-        criteria = AND(from_="hifleet.com", subject="weather")
-        messages = list(mailbox.fetch(criteria, reverse=True, limit=1))
-        if messages:
-            return messages[0].html
-    return None
-
-def load_vessel_list(path):
-    """Load vessel list from Excel."""
-    wb = load_workbook(path, data_only=True)
-    ws = wb.active
-    ships = set()
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        for cell in row:
-            if cell:
-                ships.add(str(cell).strip().upper())
-    return ships
+    try:
+        with MailBox("imap.qq.com").login(EMAIL_USER, password) as mailbox:
+            criteria = AND(from_="hifleet.com")
+            messages = list(mailbox.fetch(criteria, reverse=True, limit=1))
+            if messages:
+                print(f"Found {len(messages)} email(s)")
+                return messages[0].html
+            else:
+                print("No hifleet emails found")
+                return None
+    except Exception as e:
+        print(f"IMAP error: {e}")
+        return None
 
 def parse_hifleet_html(html):
     """Parse HiFleet email HTML to extract ship weather data."""
     ships_data = {}
+    if not html:
+        return ships_data
     
-    # Find all ship blocks - match 5 TD cells in a TR
+    # Match table rows: ship_name | forecast | type | port | ...
     ship_pattern = re.compile(
         r'<tr[^>]*>\s*<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*'
         r'<td[^>]*>(.*?)</td>\s*<td[^>]*>(.*?)</td>\s*'
@@ -62,8 +59,7 @@ def parse_hifleet_html(html):
             continue
         
         forecast = row[1].strip()
-        # Parse forecast: format "1d/3.5/1.5/5" or "1d/3.5/1.5"
-        # (day_offset, wind, wave, visibility)
+        # Parse forecast days: "1d/3.5/1.5/5" = day/wind/wave/visibility
         days = re.findall(r'(\d+m?)/(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)', forecast)
         
         ships_data[ship_name] = {
@@ -74,18 +70,133 @@ def parse_hifleet_html(html):
     
     return ships_data
 
+def load_cached_data():
+    """Load cached ship data from JSON file."""
+    try:
+        with open("hifleet_weather_76ships.json", encoding="utf-8") as f:
+            cached = json.load(f)
+        
+        ships_data = {}
+        for ship in cached.get("ships", []):
+            name = ship.get("name", "")
+            if not name or name.upper() in EXCLUDE_SHIPS:
+                continue
+            
+            data = ship.get("data", {})
+            # data keys are Chinese: 风级, 浪高, 能见度
+            # Each contains timestamps as keys
+            wind_data = data.get("风级", {})
+            wave_data = data.get("浪高", {})
+            vis_data = data.get("能见度", {})
+            
+            # Get all unique timestamps, sorted
+            all_times = set(wind_data.keys()) | set(wave_data.keys()) | set(vis_data.keys())
+            
+            # Build days array from timestamps
+            # Format each day: (day_offset, wind, wave, visibility)
+            days = []
+            for ts in sorted(all_times):
+                # Parse timestamp like "2026-07-14 1800"
+                try:
+                    dt = datetime.strptime(ts, "%Y-%m-%d %H%M")
+                    wind = wind_data.get(ts, {}).get("value", "")
+                    wave = wave_data.get(ts, {}).get("value", "")
+                    vis = vis_data.get(ts, {}).get("value", "")
+                    if wind or wave or vis:
+                        days.append((ts, wind, wave, vis))
+                except:
+                    pass
+            
+            # Simplify to daily: take midday values or average
+            daily = simplify_to_daily(wind_data, wave_data, vis_data)
+            
+            ships_data[name] = {
+                "type": ship.get("type", ""),
+                "data": data,
+                "daily": daily
+            }
+        
+        print(f"Loaded {len(ships_data)} ships from cache")
+        return ships_data
+    except Exception as e:
+        print(f"Failed to load cache: {e}")
+        return {}
+
+def simplify_to_daily(wind_data, wave_data, vis_data):
+    """Simplify timestamp data to daily values (midday or average)."""
+    # Group by day
+    by_day = defaultdict(lambda: {"wind": [], "wave": [], "vis": []})
+    
+    for ts_str, vals in wind_data.items():
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H%M")
+            day = dt.date()
+            v = vals.get("value", "")
+            if v:
+                by_day[day]["wind"].append(float(v))
+        except:
+            pass
+    
+    for ts_str, vals in wave_data.items():
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H%M")
+            day = dt.date()
+            v = vals.get("value", "")
+            if v:
+                by_day[day]["wave"].append(float(v))
+        except:
+            pass
+    
+    for ts_str, vals in vis_data.items():
+        try:
+            dt = datetime.strptime(ts_str, "%Y-%m-%d %H%M")
+            day = dt.date()
+            v = vals.get("value", "")
+            if v:
+                by_day[day]["vis"].append(float(v))
+        except:
+            pass
+    
+    # Build 7-day forecast starting from today
+    today = datetime.now().date()
+    daily = []
+    for i in range(7):
+        day = today + timedelta(days=i)
+        d = by_day.get(day, {"wind": [], "wave": [], "vis": []})
+        wind = round(sum(d["wind"]) / len(d["wind"]), 1) if d["wind"] else "-"
+        wave = round(sum(d["wave"]) / len(d["wave"]), 1) if d["wave"] else "-"
+        vis = round(sum(d["vis"]) / len(d["vis"]), 1) if d["vis"] else "-"
+        daily.append((str(i+1), str(wind), str(wave), str(vis)))
+    
+    return daily
+
 def generate_dashboard(ships_data, output_path="output/index.html"):
     """Generate HTML dashboard."""
     os.makedirs("output", exist_ok=True)
-    
     today = datetime.now().strftime("%Y-%m-%d")
     
-    # Build alert ships
+    # Get daily data (handle both email-parsed and cache format)
+    def get_day1(data):
+        if "days" in data:
+            return data["days"][0] if data["days"] else None
+        elif "daily" in data:
+            return data["daily"][0] if data["daily"] else None
+        return None
+    
+    def get_all_days(data):
+        if "days" in data:
+            return data["days"]
+        elif "daily" in data:
+            return data["daily"]
+        return []
+    
+    # Build alert ships: wind > 6 OR wave >= 3m on day 1
     alert_ships = []
     for ship, data in ships_data.items():
-        if data.get("days") and len(data["days"]) > 0:
-            wind = float(data["days"][0][1]) if data["days"][0][1] else 0
-            wave = float(data["days"][0][2]) if data["days"][0][2] else 0
+        day1 = get_day1(data)
+        if day1:
+            wind = float(day1[1]) if day1[1] and day1[1] != "-" else 0
+            wave = float(day1[2]) if day1[2] and day1[2] != "-" else 0
             if wind > 6 or wave >= 3:
                 alert_ships.append({
                     "ship": ship,
@@ -94,12 +205,13 @@ def generate_dashboard(ships_data, output_path="output/index.html"):
                     "wave": wave
                 })
     
-    # Wave >= 3m analysis
+    # Wave >= 3m ships per day
     wave3_ships = {}
     for ship, data in ships_data.items():
         wave3_ships[ship] = []
-        for i, day in enumerate(data.get("days", [])):
-            wave = float(day[2]) if day[2] else 0
+        days = get_all_days(data)
+        for i, day in enumerate(days):
+            wave = float(day[2]) if day[2] and day[2] != "-" else 0
             if wave >= 3:
                 wave3_ships[ship].append(i + 1)
     
@@ -108,7 +220,7 @@ def generate_dashboard(ships_data, output_path="output/index.html"):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>HiFleet Weather Dashboard - {today}</title>
+<title>HiFleet Weather - {today}</title>
 <style>
 body {{ font-family: Arial; background: #0a0e27; color: #c8d3f5; margin: 0; padding: 20px; }}
 .header {{ background: linear-gradient(135deg,#1a1f4e,#2d3585); padding:20px; border-radius:12px; margin-bottom:20px; }}
@@ -129,17 +241,17 @@ section {{ margin-bottom:30px; }}
 .ship-card h4 {{ color:#7aa2f7; margin:0 0 8px; }}
 .badge {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; margin:2px; }}
 .badge-red {{ background:#3d2048; color:#f7768e; }}
-.badge-orange {{ background:#3d2a00; color:#ff9e64; }}
+.no-data {{ color:#7aa2f7; text-align:center; padding:30px; font-size:16px; }}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>&#x1F6A2; HiFleet Weather Dashboard</h1>
-  <p>76 ships &middot; Updated: {today} &middot; Alert: wind&gt;6 OR wave&ge;3m</p>
+  <h1>HiFleet Weather Dashboard</h1>
+  <p>{len(ships_data)} ships &middot; Updated: {today} &middot; Alert: wind&gt;6 OR wave&ge;3m</p>
 </div>
 
 <div class="alert-box">
-  <h3>&#x26A0;&#xFE0F; Today's Alerts ({len(alert_ships)} ships)</h3>
+  <h3>Alerts ({len(alert_ships)} ships)</h3>
 """
     if alert_ships:
         html += """  <table>
@@ -151,12 +263,15 @@ section {{ margin-bottom:30px; }}
             html += f'    <tr><td>{s["ship"]}</td><td>{s["type"]}</td><td class="{wind_cls}">{s["wind"]}</td><td class="{wave_cls}">{s["wave"]}</td></tr>\n'
         html += "  </table>\n"
     else:
-        html += "  <p>No alerts today!</p>\n"
+        if ships_data:
+            html += "  <p>No alerts today.</p>\n"
+        else:
+            html += "  <p>No data available.</p>\n"
     
     html += """</div>
 
 <section>
-  <h2 style="color:#7aa2f7;">&#x1F30A; Ships with Wave &ge; 3m (Next 7 Days)</h2>
+  <h2 style="color:#7aa2f7;">Ships with Wave &ge; 3m (Next 7 Days)</h2>
   <div class="ship-grid">
 """
     
@@ -164,21 +279,19 @@ section {{ margin-bottom:30px; }}
     for ship, days in sorted(wave3_ships.items()):
         if days:
             wave3_count += 1
-            day_labels = {"1": "D1", "2": "D2", "3": "D3", "4": "D4", "5": "D5", "6": "D6", "7": "D7"}
             badges = " ".join([
-                f'<span class="badge badge-red">{day_labels.get(str(d), f"D{d}")}</span>'
-                for d in days
+                f'<span class="badge badge-red">D{d}</span>' for d in days
             ])
             html += f'    <div class="ship-card"><h4>{ship}</h4>{badges}</div>\n'
     
     if wave3_count == 0:
-        html += '    <p style="color:#7aa2f7;">No ships with wave &ge; 3m in the next 7 days.</p>\n'
+        html += '    <p class="no-data">No ships with wave &ge; 3m.</p>\n'
     
     html += """  </div>
 </section>
 
 <section>
-  <h2 style="color:#7aa2f7;">&#x1F4CA; Full 7-Day Forecast</h2>
+  <h2 style="color:#7aa2f7;">Full 7-Day Forecast</h2>
   <div style="overflow-x:auto;">
   <table>
     <tr>
@@ -194,13 +307,12 @@ section {{ margin-bottom:30px; }}
 """
     
     for ship, data in sorted(ships_data.items()):
-        days = data.get("days", [])
+        days = get_all_days(data)
         row = f'    <tr><td>{ship}</td><td>{data.get("type","")}</td>'
         for i in range(7):
             if i < len(days):
-                w = days[i]
-                wind = w[1] if w[1] else "-"
-                wave = w[2] if w[2] else "-"
+                wind = days[i][1] if len(days[i]) > 1 else "-"
+                wave = days[i][2] if len(days[i]) > 2 else "-"
                 wind_cls = "wind-red" if wind != "-" and float(wind) > 6 else ""
                 wave_cls = "wave-red" if wave != "-" and float(wave) >= 3 else ("wave-orange" if wave != "-" and float(wave) >= 2 else "")
                 row += f'<td class="{wind_cls}">{wind}</td><td class="{wave_cls}">{wave}</td>'
@@ -222,25 +334,22 @@ section {{ margin-bottom:30px; }}
 def main():
     print("Fetching HiFleet email...")
     html = fetch_hifleet_email()
-    if not html:
-        print("No email found, using cached data")
-        with open("hifleet_weather_76ships.json") as f:
-            ships_data = json.load(f)
-    else:
-        if os.path.exists(VESSEL_LIST_FILE):
-            vessels = load_vessel_list(VESSEL_LIST_FILE)
-            print(f"Loaded {len(vessels)} vessels from list")
-        else:
-            vessels = None
-        
+    
+    if html:
         ships_data = parse_hifleet_html(html)
         print(f"Parsed {len(ships_data)} ships from email")
+    else:
+        print("No email - loading cached data...")
+        ships_data = load_cached_data()
     
-    os.makedirs("output", exist_ok=True)
-    with open("output/ships_data.json", "w", encoding="utf-8") as f:
-        json.dump(ships_data, f, ensure_ascii=False, indent=2)
+    if not ships_data:
+        print("WARNING: No ship data. Creating placeholder.")
+        with open("output/index.html", "w", encoding="utf-8") as f:
+            f.write("<html><body style='background:#0a0e27;color:#7aa2f7;font-family:Arial;padding:40px;'>"
+                    "<h1>No data available</h1><p>Please check email configuration.</p></body></html>")
+    else:
+        generate_dashboard(ships_data)
     
-    generate_dashboard(ships_data)
     print("Done!")
 
 if __name__ == "__main__":
