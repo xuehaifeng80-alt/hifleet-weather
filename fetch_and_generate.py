@@ -205,12 +205,19 @@ def load_cached():
         with open("hifleet_weather_76ships.json", encoding="utf-8") as f:
             d = json.load(f)
         ships = d.get("ships", [])
-        # 提取col_dts
+        # 提取col_dts：(date, time) 元组列表
         sample = ships[0]['data'] if ships else {}
         all_keys = set()
         for p in ['风级','能见度','浪高']:
             all_keys.update(sample.get(p,{}).keys())
-        col_dts = sorted(all_keys)
+        # 解析 "2026-07-14 0600" → ("2026-07-14", "0600")
+        col_dts = []
+        for key in sorted(all_keys):
+            parts = key.rsplit(' ', 1)
+            if len(parts) == 2:
+                col_dts.append((parts[0], parts[1]))
+            else:
+                col_dts.append((key, ''))
         return ships, col_dts
     except Exception as e:
         print(f"Cache error: {e}")
@@ -408,9 +415,6 @@ handy    td.ship {{ background:#E0FFFF !important; }}
 """
     for d in dates:
         is_today = (d == today)
-        items = [(n, v) for n, days in wave3_ships.items() if d in days
-                 for k, vd in next((s['data']['浪高'].items() for s in ships if s['name']==n), [('',{})]) if k.startswith(d) and not (lambda: False)() ]
-        # 重构：取每天最大值
         day_ships = []
         for ship in ships:
             max_w = 0
