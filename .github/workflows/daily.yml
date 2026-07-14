@@ -21,7 +21,7 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_AUTH: ${{ secrets.EMAIL_AUTH }}
         run: |
-          pip install imap-tools openpyxl jinja2 requests
+          pip install imap-tools openpyxl jinja2 requests beautifulsoup4
           python fetch_and_generate.py
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
