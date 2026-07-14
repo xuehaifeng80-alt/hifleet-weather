@@ -26,11 +26,12 @@ WAVE_RED       = 3.0
 WAVE_ORANGE    = 2.5
 
 # 邮件Excel颜色对照
-WIND_COLORS = {   # 蒲福风级 → 背景色
+WIND_COLORS = {   # 蒲福风级 → 背景色（与邮件Excel一致）
     (1, 4):   '#C6EFCE',  # 绿色 1-4级
     (5, 5):   '#FFEB9C',  # 黄色 5级
-    (6, 9):   '#FFFF00',  # 黄色 6-9级
-    (10, 99): '#FF6600',  # 橙色 >=10级
+    (6, 6):   '#E2A7D7',  # 粉紫色 6级（邮件原版）
+    (7, 9):   '#FF6600',  # 橙色 7-9级
+    (10, 99): '#FF0000',  # 红色 >=10级
 }
 SHIP_TYPE_COLORS = {
     'VLOC Own':  '#E8D5F5',
@@ -68,11 +69,13 @@ def wind_color(level_str):
 def wave_color(val_str):
     try:
         v = float(val_str)
-        if v >= WAVE_RED:    return '#FF6600'
-        if v >= WAVE_ORANGE: return '#FFEB9C'
-        return '#C6EFCE'
+        if v >= 4.0:  return '#FFAAAA'   # 桃红 — 高浪 >=4m
+        if v >= 3.0:  return '#FFFF00'   # 黄 — 中浪 >=3m
+        if v >= 2.5:  return '#9DC3E6'  # 中蓝 — 2.5~3m
+        if v >= 1.5:  return '#DEEAF1'  # 浅蓝 — 1.5~2.5m
+        return        '#FFFFFF'          # 白 — <1.5m
     except:
-        return '#C6EFDA'
+        return '#FFFFFF'
 
 def vis_color(val_str):
     try:
@@ -150,7 +153,7 @@ def parse_html(html_text):
     # 解析船舶数据行（从 row 2 开始）
     data_rows = rows[2:]
     ships = []
-    known_params = {'风级','潮差','能见度','浪高'}
+    known_params = {'风级','涌差','能见度','浪高'}
     i = 0
     while i < len(data_rows):
         cells0 = [c.get_text(strip=True) for c in data_rows[i].find_all(['td','th'])]
@@ -164,7 +167,7 @@ def parse_html(html_text):
 
         ship = {
             'name': name, 'type': stype, 'port': port, 'is_own': is_own,
-            'data': {'风级':{},'潮差':{},'能见度':{},'浪高':{}}
+            'data': {'风级':{},'涌差':{},'能见度':{},'浪高':{}}
         }
         ships.append(ship)
 
@@ -177,7 +180,7 @@ def parse_html(html_text):
                 ship['data']['风级'][f"{d} {t}"] = {'value': val, 'bg': bg}
 
         # 潮差 / 能见度 / 浪高：cells[1:]
-        for offset, param in [(1,'潮差'),(2,'能见度'),(3,'浪高')]:
+        for offset, param in [(1,'涌差'),(2,'能见度'),(3,'浪高')]:
             if i + offset >= len(data_rows): break
             cells = [c.get_text(strip=True) for c in data_rows[i+offset].find_all(['td','th'])]
             bgs   = [c.get('bgcolor','') or '' for c in data_rows[i+offset].find_all(['td','th'])]
@@ -342,15 +345,20 @@ tr.param-row td {{ background:#1e2340; }}
 .vis-cell  {{ background:#DEEBF7 !important; }}
 .wave-cell {{ background:#FCE4D6 !important; }}
 
-/* 船型颜色 */
-.vloc-own td.ship {{ background:#E8D5F5 !important; }}
-.vloc    td.ship {{ background:#DDEEFF !important; }}
-.cape    td.ship {{ background:#FFE0CC !important; }}
-.pana    td.ship {{ background:#FFFFCC !important; }}
-ultra    td.ship {{ background:#CCFFE0 !important; }}
-supra    td.ship {{ background:#FFFFE0 !important; }}
-handy    td.ship {{ background:#E0FFFF !important; }}
-.unkn    td.ship {{ background:#F5F5F5 !important; color:#ccc !important; }}
+/* 船型标签（黄色标签+蓝色粗体，与邮件一致） */
+.ship-type-tag {{
+  display: inline-block;
+  background:#FFEB9C;
+  color:#0033CC;
+  font-size:10px;
+  font-weight:700;
+  padding:1px 6px;
+  border-radius:4px;
+  margin-top:2px;
+}}
+/* 船舶行去掉底色，只留边框 */
+tr.ship-row td {{ border-top:1px solid #888; }}
+.param-row td {{ border-top:1px dashed #ccc; }}
 
 /* 滚动提示 */
 .hint {{ color:#555; font-size:0.7em; text-align:right; margin-bottom:4px; }}
@@ -374,14 +382,14 @@ handy    td.ship {{ background:#E0FFFF !important; }}
 <div class="legend-wrap">
   <div class="legend-title">颜色说明</div>
   <div class="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:#C6EFCE"></div><span>风1-4级 / 浪&lt;2.5m / 能见≥10nmi</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FFEB9C"></div><span>风5-9级 / 浪2.5-3m / 能见5-10nmi</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FF6600"></div><span>风≥10级 / 浪≥3m / 能见&lt;5nmi</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#E8D5F5"></div><span>VLOC Own</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#DDEEFF"></div><span>VLOC</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FFE0CC"></div><span>Capesize</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FFFFCC"></div><span>Panamax</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#CCFFE0"></div><span>Ultramax</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#C6EFCE"></div><span>风1-4级</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#FFEB9C"></div><span>风5级</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#E2A7D7"></div><span>风6级</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#FF6600"></div><span>风7-9级</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#DEEAF1"></div><span>浪&lt;1.5m</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#9DC3E6"></div><span>浪1.5-3m</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#FFFF00"></div><span>浪3-4m</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#FFAAAA"></div><span>浪≥4m</span></div>
   </div>
 </div>
 
@@ -475,12 +483,9 @@ handy    td.ship {{ background:#E0FFFF !important; }}
     }
 
     for ship in ships:
-        tcls = type_class_map.get(ship['type'], 'unkn')
-        row_key = f'{ship["name"]}_{ship["type"]}'
-
-        # 风级行
-        html += f'<tr class="{tcls}">'
-        html += f'<td class="ship">{ship["name"]}<span class="etype">{ship["type"]}{" ★" if ship.get("is_own") else ""}</span></td>\n'
+        # 风级行（船名+船型标签，与邮件一致）
+        html += '<tr class="ship-row">'
+        html += f'<td class="ship">{ship["name"]}<br><span class="ship-type-tag">{ship["type"]}{" ★" if ship.get("is_own") else ""}</span></td>\n'
         for d, t in col_dts:
             key = f"{d} {t}"
             vd  = ship['data']['风级'].get(key, {})
@@ -495,18 +500,7 @@ handy    td.ship {{ background:#E0FFFF !important; }}
             html += f'<td class="{cls}" style="{style}">{val}</td>\n'
         html += "</tr>\n"
 
-        # 潮差行
-        html += '<tr class="param-row">'
-        html += '<td class="ship"><span class="param">潮差</span></td>\n'
-        for d, t in col_dts:
-            key = f"{d} {t}"
-            vd  = ship['data']['潮差'].get(key, {})
-            val = vd.get('value', '')
-            bg  = vd.get('bg', '') or '#FFF2CC'
-            style = f'background:{bg}' if bg not in ('','None') else ''
-            html += f'<td class="v tide-cell" style="{style}">{val}</td>\n'
-        html += "</tr>\n"
-
+        # 涌差行已移除（不需要）
         # 能见度行
         html += '<tr class="param-row">'
         html += '<td class="ship"><span class="param">能见度</span></td>\n'
