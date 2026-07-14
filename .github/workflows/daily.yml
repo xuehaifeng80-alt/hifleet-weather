@@ -2,7 +2,7 @@ name: Daily HiFleet Weather Sync
 
 on:
   schedule:
-    - cron: '50 15 * * *'
+    - cron: '0 1 * * *'  # 09:00 CST daily (UTC 01:00)
   workflow_dispatch:
 
 permissions:
