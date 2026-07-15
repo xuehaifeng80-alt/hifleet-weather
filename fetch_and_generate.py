@@ -10,6 +10,7 @@ HiFleet Weather Dashboard Generator (Repo/CI Version)
 import os
 import json
 import re
+import shutil
 from datetime import datetime
 from collections import defaultdict
 
@@ -414,4 +415,11 @@ if __name__ == "__main__":
     os.makedirs("output", exist_ok=True)
     out = os.path.join("output", "index.html")
     build_html(ships, col_dts, out)
+
+    # Also copy JSON to output so GitHub Pages can serve it
+    json_src = find_json()
+    json_dst = os.path.join("output", os.path.basename(json_src))
+    shutil.copy2(json_src, json_dst)
+    print("Copied JSON: %s -> %s" % (json_src, json_dst))
+
     print("Done!")
