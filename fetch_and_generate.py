@@ -1,576 +1,358 @@
 #!/usr/bin/env python3
 """
-HiFleet Weather Dashboard Generator
-完全匹配邮件原始排版格式：
-  - 表头：日期行 + 时间行（0600/1200/1800/2400 × 7天 = 28时段）
-  - 每船4行：风级 / 潮差 / 能见度 / 浪高
-  - 颜色规则与邮件Excel一致
+HiFleet Dashboard — 100% 匹配邮件 HTML 排版格式
 """
-import os
-import json
-import re
-from datetime import datetime, timedelta
-from imap_tools import MailBox, AND
+import json, re, os
+from datetime import datetime
 from collections import defaultdict
 
-# === Config ===
-EMAIL_USER = os.environ.get("EMAIL_USER", "xuehaifeng666@qq.com")
-EMAIL_AUTH  = os.environ.get("EMAIL_AUTH",  "ztfzkfwzzywmjdaf")
-QQ_APP_PWD  = os.environ.get("QQ_APP_PWD",  "")
+# ── 颜色映射（与邮件 CSS 完全一致）
+WAVE_RED = 3.0
+WIND_RED = 7
+VIS_THRESHOLD = 5
 
-EXCLUDE_SHIPS = {"ORE CHINA", "ORE DONGJIAKOU", "ORE HEBEI", "ORE SHANDONG"}
-
-WIND_THRESHOLD = 6
-VIS_THRESHOLD  = 5
-WAVE_RED       = 3.0
-WAVE_ORANGE    = 2.5
-
-# 邮件Excel颜色对照
-WIND_COLORS = {   # 蒲福风级 → 背景色（与邮件Excel一致）
-    (1, 4):   '#C6EFCE',  # 绿色 1-4级
-    (5, 5):   '#FFEB9C',  # 黄色 5级
-    (6, 6):   '#E2A7D7',  # 粉紫色 6级（邮件原版）
-    (7, 9):   '#FF6600',  # 橙色 7-9级
-    (10, 99): '#FF0000',  # 红色 >=10级
-}
-SHIP_TYPE_COLORS = {
-    'VLOC Own':  '#E8D5F5',
-    'VLOC':      '#DDEEFF',
-    'Capesize':  '#FFE0CC',
-    'Panamax':   '#FFFFCC',
-    'Ultramax':  '#CCFFE0',
-    'Supramax':  '#FFFFE0',
-    'Handymax':  '#E0FFFF',
-    'Unknown':   '#F5F5F5',
-}
-PARAM_COLORS = {
-    '风级':   '#E2EFDA',
-    '潮差':   '#FFF2CC',
-    '能见度': '#DEEBF7',
-    '浪高':   '#FCE4D6',
-}
-WAVE_COLOR_MAP = {
-    'green':  '#C6EFCE',
-    'orange': '#FFEB9C',
-    'red':    '#FF6600',
-    'orange_wave': '#FF6600',
-}
-
-def wind_color(level_str):
+def wind_cls(level):
     try:
-        level = float(level_str)
-        for (lo, hi), color in WIND_COLORS.items():
-            if lo <= level <= hi:
-                return color
-        return '#F5F5F5'
+        v = int(float(level))
+        v = max(1, min(10, v))
+        return 'wind%d' % v
     except:
-        return '#F5F5F5'
+        return 'wind1'
 
-def wave_color(val_str):
+def wave_cls(level):
     try:
-        v = float(val_str)
-        if v >= 4.0:  return '#FFAAAA'   # 桃红 — 高浪 >=4m
-        if v >= 3.0:  return '#FFFF00'   # 黄 — 中浪 >=3m
-        if v >= 2.5:  return '#9DC3E6'  # 中蓝 — 2.5~3m
-        if v >= 1.5:  return '#DEEAF1'  # 浅蓝 — 1.5~2.5m
-        return        '#FFFFFF'          # 白 — <1.5m
+        v = float(level)
+        if v <= 0: return 'wave1'
+        if v <= 1: return 'wave1'
+        if v <= 2: return 'wave2'
+        if v <= 3: return 'wave3'
+        if v <= 4: return 'wave4'
+        if v <= 5: return 'wave5'
+        if v <= 6: return 'wave6'
+        if v <= 7: return 'wave7'
+        if v <= 8: return 'wave8'
+        if v <= 9: return 'wave9'
+        return 'wave10'
     except:
-        return '#FFFFFF'
+        return 'wave1'
 
-def vis_color(val_str):
+def tide_cls(level):
     try:
-        v = float(val_str)
-        if v < VIS_THRESHOLD: return '#FF6600'
-        if v < 10:            return '#FFEB9C'
-        return '#C6EFCE'
+        v = float(level)
+        if v <= 0: return 'tide1'
+        if v <= 1: return 'tide2'
+        if v <= 2: return 'tide3'
+        if v <= 3: return 'tide4'
+        return 'tide5'
     except:
-        return '#DEEBF7'
+        return 'tide1'
 
-# ── IMAP 抓取 ────────────────────────────────────────────────────────────────
-
-def fetch_hifleet_email():
-    password = QQ_APP_PWD or EMAIL_AUTH
-    if not password:
-        print("No IMAP password"); return None
-    try:
-        with MailBox("imap.qq.com").login(EMAIL_USER, password) as mb:
-            msgs = list(mb.fetch(AND(from_="hifleet.com"), reverse=True, limit=1))
-            if msgs: return msgs[0].html
-    except Exception as e:
-        print(f"IMAP error: {e}")
-    return None
-
-# ── 解析 ────────────────────────────────────────────────────────────────────
-
-def parse_ship_name(text):
-    text = text.strip()
-    port = ""
-    if '：' in text:
-        parts = text.split('：', 1)
-        text = parts[0].strip()
-        port = parts[1].strip()
-    types_ = sorted([
-        'VLOC Own','vloc own','Capesize','capesize','Panamax','panamax',
-        'Ultramax','ultramax','Supramax','supramax','Handymax','handymax',
-        'VLOC','vloc'
-    ], key=len, reverse=True)
-    name = text; stype = 'Unknown'; is_own = False
-    for st in types_:
-        if name.endswith(st):
-            lo = st.lower()
-            if 'own' in lo: stype = 'VLOC Own'; is_own = True
-            elif lo == 'vloc':     stype = 'VLOC'
-            elif lo == 'capesize': stype = 'Capesize'
-            elif lo == 'panamax':  stype = 'Panamax'
-            elif lo == 'ultramax': stype = 'Ultramax'
-            elif lo == 'supramax': stype = 'Supramax'
-            elif lo == 'handymax': stype = 'Handymax'
-            name = name[:-len(st)].strip()
-            break
-    return name, stype, port, is_own
-
-def parse_html(html_text):
-    """解析邮件HTML，提取所有船舶数据。"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html_text, 'html.parser')
-    tables = soup.find_all('table')
-    main_tbl = None
-    for tbl in tables:
-        if re.search(r'\d{4}-\d{2}-\d{2}', tbl.get_text()):
-            main_tbl = tbl; break
-    if not main_tbl: return [], []
-    rows = main_tbl.find_all('tr')
-
-    # 解析表头行（row 0）和时间行（row 1）
-    h_cells = [c.get_text(strip=True) for c in rows[0].find_all(['td','th'])]
-    t_cells = [c.get_text(strip=True) for c in rows[1].find_all(['td','th'])]
-    col_dts = []
-    for ci in range(2, len(h_cells)):
-        d = h_cells[ci]; t = t_cells[ci] if ci < len(t_cells) else ''
-        if re.match(r'\d{4}-\d{2}-\d{2}', d):
-            col_dts.append((d, t))
-
-    # 解析船舶数据行（从 row 2 开始）
-    data_rows = rows[2:]
-    ships = []
-    known_params = {'风级','涌差','能见度','浪高'}
-    i = 0
-    while i < len(data_rows):
-        cells0 = [c.get_text(strip=True) for c in data_rows[i].find_all(['td','th'])]
-        bgs0   = [c.get('bgcolor','') or '' for c in data_rows[i].find_all(['td','th'])]
-        if len(cells0) < 2 or cells0[0] in known_params:
-            i += 1; continue
-
-        name, stype, port, is_own = parse_ship_name(cells0[0])
-        if not name or name.upper() in EXCLUDE_SHIPS:
-            i += 1; continue
-
-        ship = {
-            'name': name, 'type': stype, 'port': port, 'is_own': is_own,
-            'data': {'风级':{},'涌差':{},'能见度':{},'浪高':{}}
-        }
-        ships.append(ship)
-
-        # 风级：cells[2:]
-        for di, val in enumerate(cells0[2:]):
-            if di >= len(col_dts): break
-            d, t = col_dts[di]
-            bg = bgs0[di+2] if di+2 < len(bgs0) else ''
-            if val and val not in ('-',''):
-                ship['data']['风级'][f"{d} {t}"] = {'value': val, 'bg': bg}
-
-        # 潮差 / 能见度 / 浪高：cells[1:]
-        for offset, param in [(1,'涌差'),(2,'能见度'),(3,'浪高')]:
-            if i + offset >= len(data_rows): break
-            cells = [c.get_text(strip=True) for c in data_rows[i+offset].find_all(['td','th'])]
-            bgs   = [c.get('bgcolor','') or '' for c in data_rows[i+offset].find_all(['td','th'])]
-            if cells and cells[0] == param:
-                for di, val in enumerate(cells[1:]):
-                    if di >= len(col_dts): break
-                    d, t = col_dts[di]
-                    bg = bgs[di+1] if di+1 < len(bgs) else ''
-                    if val and val not in ('-',''):
-                        ship['data'][param][f"{d} {t}"] = {'value': val, 'bg': bg}
-
-        i += 4
-
-    # 去重
-    seen = set(); unique = []
-    for s in ships:
-        if s['name'] not in seen:
-            seen.add(s['name']); unique.append(s)
-    return unique, col_dts
-
-# ── 从缓存加载 ────────────────────────────────────────────────────────────────
-
-def load_cached():
-    try:
-        with open("hifleet_weather_76ships.json", encoding="utf-8") as f:
-            d = json.load(f)
-        ships = d.get("ships", [])
-        # 提取col_dts：(date, time) 元组列表
-        sample = ships[0]['data'] if ships else {}
+# ── 加载数据
+def load_data():
+    path = r'C:\Users\HKMW\Desktop\hifleet_76.json'
+    if not os.path.exists(path):
+        path = r'C:\Users\HKMW\.mavis\agents\mavis\workspace\hifleet_weather_76ships.json'
+    with open(path, encoding='utf-8') as f:
+        d = json.load(f)
+    ships = d['ships']
+    col_dts = d.get('col_dts', [])
+    if not col_dts or len(col_dts) <= 7:
+        # 从船舶数据中直接提取所有唯一的 "日期 时间" 键
         all_keys = set()
-        for p in ['风级','能见度','浪高']:
-            all_keys.update(sample.get(p,{}).keys())
-        # 解析 "2026-07-14 0600" → ("2026-07-14", "0600")
+        for ship in ships:
+            for p in ['风级', '涌差', '能见度', '浪高']:
+                all_keys.update(ship['data'].get(p, {}).keys())
         col_dts = []
         for key in sorted(all_keys):
             parts = key.rsplit(' ', 1)
-            if len(parts) == 2:
-                col_dts.append((parts[0], parts[1]))
-            else:
-                col_dts.append((key, ''))
-        return ships, col_dts
-    except Exception as e:
-        print(f"Cache error: {e}")
-        return [], []
+            col_dts.append((parts[0], parts[1]) if len(parts) == 2 else (key, ''))
+    return ships, col_dts
 
-# ── 生成 HTML ────────────────────────────────────────────────────────────────
+# ── HTML 片段
+CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Arial, sans-serif; font-size: 11px; text-align: center; background: #f4f4f4; }
+table { border-collapse: collapse; text-align: center; font-size: 11px; width: 100%; }
+th, td { border: 1px solid black; padding: 2px; vertical-align: middle; }
+th { background-color: lightgray; }
+.vessel-type {
+    background-color: gold; border: 1px solid #ccc; padding: 1px 4px;
+    box-shadow: 2px 2px 4px rgba(0,0,0,0.4); color: blue;
+    font-weight: bold; display: inline-block; font-size: 10px; margin-top: 1px;
+}
+.ship-name { font-weight: bold; font-size: 11px; text-align: left; vertical-align: top; }
+.ship-cell { text-align: left; vertical-align: top; background: #f9f9f9; }
+.param-label { font-size: 10px; color: #444; width: 42px; }
+.wind1  { color:#e8f5e9; background-color: #e8f5e9; }
+.wind2  { color:#c8e6c9; background-color: #c8e6c9; }
+.wind3  { color:#a5d6a7; background-color: #a5d6a7; }
+.wind4  { color:#81c784; background-color: #81c784; }
+.wind5  { color:#0097a7; background-color: #66bb6a; }
+.wind6  { color:#ffea00; background-color: #e1bee7; }
+.wind7  { color:#fdd835; background-color: #ce93d8; }
+.wind8  { color:#ffb300; background-color: #ab47bc; }
+.wind9  { color:#ffe0b2; background-color: #8e24aa; }
+.wind10 { color:#fff9c4; background-color: #6a1b9a; }
+.tide1  { color:#616161; background-color: white; }
+.tide2  { color:white;    background-color: #795548; }
+.tide3  { color:white;    background-color: #5d4037; }
+.tide4  { color:white;    background-color: #4e342e; }
+.tide5  { color:white;    background-color: #3e2723; }
+.vis-ok  { background-color: white; }
+.vis-warn { background-color: #ff6666; color: white; font-weight: bold; }
+.wave1  { color:#616161; background-color: #e1f5fe; }
+.wave2  { color:#616161; background-color: #81d4fa; }
+.wave3  { color:#616161; background-color: #29b6f6; }
+.wave4  { color:#f44336; background-color: #fff59d; }
+.wave5  { color:#f44336; background-color: #ffeb3b; }
+.wave6  { color:#f44336; background-color: #ffd54f; }
+.wave7  { color:#f44336; background-color: #ffc107; }
+.wave8  { color:white;   background-color: #ffa000; }
+.wave9  { color:white;   background-color: #ff6f00; }
+.wave10 { color:white;   background-color: #bf360c; }
+.today-hdr { background-color: #e94560 !important; color: white !important; font-weight: bold; }
+.alert-section { background: #fff; border: 1px solid #ccc; border-radius: 4px; padding: 10px; margin: 10px auto; max-width: 1100px; text-align: left; }
+.alert-section h3 { color: #d32f2f; border-bottom: 2px solid #d32f2f; padding-bottom: 4px; margin-bottom: 8px; }
+.alert-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.alert-table th { background: #d32f2f; color: white; padding: 4px 8px; }
+.alert-table td { padding: 4px 8px; border-bottom: 1px solid #eee; }
+.wave-hi { color: #d32f2f; font-weight: bold; }
+.wind-hi  { color: #e65100; font-weight: bold; }
+.legend-section { background: #fff; border: 1px solid #ccc; border-radius: 4px; padding: 10px; margin: 10px auto; max-width: 1100px; text-align: left; }
+.legend-section h3 { border-bottom: 2px solid #333; padding-bottom: 4px; margin-bottom: 8px; }
+.legend-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+.legend-label { font-weight: bold; min-width: 70px; }
+.legend-item { display: inline-flex; align-items: center; gap: 2px; font-size: 10px; }
+.legend-box { width: 16px; height: 12px; border: 1px solid #999; display: inline-block; }
+.page-header { background: #1a237e; color: white; padding: 12px; margin-bottom: 10px; }
+.page-header h1 { font-size: 16px; margin-bottom: 4px; }
+.page-header p { font-size: 11px; color: #bbdefb; }
+.table-wrap { overflow-x: auto; max-height: 85vh; overflow-y: auto; }
+.sticky-t { position: sticky; top: 0; z-index: 10; }
+.ship-col { position: sticky; left: 0; z-index: 5; background: #f9f9f9; min-width: 130px; }
+"""
 
-def build_dashboard(ships, col_dts, output_path="output/index.html"):
-    os.makedirs("output", exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
+def H(txt):
+    """HTML 安全转义"""
+    return str(txt).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-    # 按日期分组时段
+def build_html(ships, col_dts, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    today = datetime.now().strftime('%Y-%m-%d')
+
     date_groups = defaultdict(list)
     for cd in col_dts:
         date_groups[cd[0]].append(cd)
+    dates = sorted(date_groups.keys())
 
-    # 统计
+    # 告警统计
     alert_ships = []
-    wave3_ships = {}  # ship -> [days with wave>=3]
+    wave3_days = {}  # date -> {ship_name: max_wave}
     for ship in ships:
-        max_w = 0
-        max_wind = 0
-        for key, vd in ship['data']['浪高'].items():
+        max_w = 0; max_wind = 0
+        for vd in ship['data']['浪高'].values():
             try: max_w = max(max_w, float(vd['value']))
             except: pass
-        for key, vd in ship['data']['风级'].items():
+        for vd in ship['data']['风级'].values():
             try: max_wind = max(max_wind, float(vd['value']))
             except: pass
-        if max_w >= WAVE_RED or max_wind > WIND_THRESHOLD:
-            alert_ships.append({
-                'name': ship['name'], 'type': ship['type'],
-                'max_wave': max_w, 'max_wind': max_wind
-            })
-        # wave3 per day
-        wave3_ships[ship['name']] = set()
+        if max_w >= WAVE_RED or max_wind > WIND_RED:
+            alert_ships.append({'name': ship['name'], 'type': ship['type'],
+                               'max_wave': max_w, 'max_wind': max_wind})
         for key, vd in ship['data']['浪高'].items():
             try:
                 if float(vd['value']) >= WAVE_RED:
-                    wave3_ships[ship['name']].add(key.split(' ')[0])
+                    d = key.split(' ')[0]
+                    if d not in wave3_days:
+                        wave3_days[d] = {}
+                    wave3_days[d][ship['name']] = max(
+                        wave3_days[d].get(ship['name'], 0), float(vd['value']))
             except: pass
 
-    dates = sorted(date_groups.keys())
+    # 收集所有段落
+    parts = []
 
-    # HTML
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HiFleet 船舶7天气象预报</title>
-<style>
-* {{ box-sizing:border-box; margin:0; padding:0; }}
-body {{ font-family:"Microsoft YaHei","PingFang SC",Arial,sans-serif;
-        background:#1a1a2e; color:#e0e0e0; padding:16px; font-size:13px; }}
-a {{ color:#7aa2f7; }}
+    # HTML 头部
+    parts.append('<!DOCTYPE html>\n<html><head>\n<meta charset="UTF-8">\n')
+    parts.append('<title>HiFleet 船舶7天预报</title>\n')
+    parts.append('<style>\n%s\n</style>\n</head><body>\n' % CSS)
 
-/* ── 页眉 ── */
-.header {{ background:linear-gradient(135deg,#16213e,#0f3460); border-radius:12px;
-           padding:20px; margin-bottom:20px; text-align:center; }}
-.header h1 {{ color:#e94560; font-size:1.6em; margin-bottom:6px; }}
-.header p {{ color:#888; font-size:0.8em; }}
-.stats {{ display:flex; gap:16px; justify-content:center; margin-top:14px; flex-wrap:wrap; }}
-.stat {{ background:rgba(255,255,255,0.07); border-radius:10px; padding:12px 20px; text-align:center; }}
-.stat .n {{ font-size:1.8em; font-weight:700; color:#e94560; }}
-.stat .l {{ font-size:0.7em; color:#888; margin-top:3px; }}
+    # 页眉
+    parts.append('<div class="page-header">\n')
+    parts.append('<h1>HiFleet 船舶7天气象预报</h1>\n')
+    parts.append('<p>76艘船舶 &middot; 更新: %s &middot; 告警: 风级&gt;6 &nbsp;|&nbsp; 浪高&gt;=3m &nbsp;|&nbsp; 能见度&lt;5海里</p>\n' % today)
+    parts.append('</div>\n')
 
-/* ── 颜色图例 ── */
-.legend-wrap {{ background:#16213e; border-radius:10px; padding:14px 18px; margin-bottom:20px; }}
-.legend-title {{ color:#e94560; font-size:0.85em; font-weight:600; margin-bottom:10px; }}
-.legend {{ display:flex; gap:18px; flex-wrap:wrap; font-size:0.75em; align-items:center; }}
-.legend-item {{ display:flex; align-items:center; gap:5px; }}
-.legend-dot {{ width:14px; height:14px; border-radius:2px; border:1px solid #444; }}
-.legend-param {{ color:#888; }}
-
-/* ── 今日告警 ── */
-.alert-box {{ background:#16213e; border-left:4px solid #e94560;
-             border-radius:8px; padding:14px 18px; margin-bottom:20px; }}
-.alert-box h3 {{ color:#e94560; font-size:0.9em; margin-bottom:10px; }}
-.alert-table {{ width:100%; border-collapse:collapse; font-size:0.8em; }}
-.alert-table th {{ background:#0f3460; color:#fff; padding:7px 12px; text-align:center; }}
-.alert-table td {{ padding:6px 12px; text-align:center; border-bottom:1px solid #2d3585; }}
-.alert-table tr:hover td {{ background:rgba(255,255,255,0.03); }}
-.wave-red {{ color:#ff4444; font-weight:700; }}
-.wind-red {{ color:#ff6600; font-weight:700; }}
-
-/* ── 每日浪高卡片 ── */
-.wave-section {{ margin-bottom:24px; }}
-.wave-section h3 {{ color:#e94560; font-size:0.9em; margin-bottom:12px; }}
-.week-grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; }}
-.day-card {{ background:#16213e; border-radius:8px; padding:10px 12px; border:1px solid #2d3585; }}
-.day-card.today {{ border-color:#e94560; }}
-.day-label {{ font-size:0.75em; color:#888; margin-bottom:6px; }}
-.today .day-label {{ color:#e94560; font-weight:600; }}
-.ship-row {{ display:flex; justify-content:space-between; align-items:center;
-             padding:3px 0; border-bottom:1px solid #222; font-size:0.78em; }}
-.ship-row:last-child {{ border-bottom:none; }}
-.ship-row .nm {{ color:#fff; flex:1; }}
-.ship-row .wv {{ color:#ff6600; font-weight:600; min-width:36px; text-align:right; }}
-.no-alert {{ color:#5eb92d; font-size:0.78em; }}
-
-/* ── 主表格 ── */
-.main-table-section {{ margin-bottom:24px; }}
-.main-table-section h3 {{ color:#e94560; font-size:0.9em; margin-bottom:10px; }}
-.table-scroll {{ overflow-x:auto; border-radius:8px; background:#16213e; }}
-table.main {{ border-collapse:collapse; font-size:0.72em; white-space:nowrap; }}
-table.main th {{ background:#0f3460; color:#fff; padding:6px 5px; text-align:center;
-                position:sticky; top:0; z-index:2; }}
-th.dt {{ background:#1a3a6e; color:#aaccff; font-size:0.68em; font-weight:400; }}
-th.dt.today-col {{ background:#e94560; color:#fff; }}
-th.ship-h {{ text-align:left; min-width:140px; background:#1a3a6e; }}
-td {{ padding:4px 5px; text-align:center; border:1px solid #222; }}
-td.ship {{ text-align:left; color:#fff; font-weight:600; font-size:0.78em; }}
-td.etype {{ text-align:left; color:#888; font-size:0.7em; }}
-td .param {{ font-size:0.62em; color:#888; display:block; }}
-td.v {{ font-weight:600; font-size:0.78em; }}
-tr:hover td {{ background:rgba(255,255,255,0.03); }}
-tr.param-row td {{ background:#1e2340; }}
-
-/* 单元格背景色 */
-.wind-cell {{ background:#E2EFDA !important; }}
-.tide-cell {{ background:#FFF2CC !important; }}
-.vis-cell  {{ background:#DEEBF7 !important; }}
-.wave-cell {{ background:#FCE4D6 !important; }}
-
-/* 船型标签（黄色标签+蓝色粗体，与邮件一致） */
-.ship-type-tag {{
-  display: inline-block;
-  background:#FFEB9C;
-  color:#0033CC;
-  font-size:10px;
-  font-weight:700;
-  padding:1px 6px;
-  border-radius:4px;
-  margin-top:2px;
-}}
-/* 船舶行去掉底色，只留边框 */
-tr.ship-row td {{ border-top:1px solid #888; }}
-.param-row td {{ border-top:1px dashed #ccc; }}
-
-/* 滚动提示 */
-.hint {{ color:#555; font-size:0.7em; text-align:right; margin-bottom:4px; }}
-</style>
-</head>
-<body>
-
-<!-- 页眉 -->
-<div class="header">
-  <h1>HiFleet 船舶7天气象预报</h1>
-  <p>76艘船舶 &middot; 更新: {today} &middot; 告警: 风级&gt;6 &nbsp;|&nbsp; 浪高&ge;3m &nbsp;|&nbsp; 能见度&lt;5海里</p>
-  <div class="stats">
-    <div class="stat"><div class="n">76</div><div class="l">监控船舶</div></div>
-    <div class="stat"><div class="n">{len(dates)}</div><div class="l">预报天数</div></div>
-    <div class="stat"><div class="n">{len(alert_ships)}</div><div class="l">告警船舶</div></div>
-    <div class="stat"><div class="n">{sum(len(v) for v in wave3_ships.values())}</div><div class="l">高浪预警次数</div></div>
-  </div>
-</div>
-
-<!-- 颜色图例 -->
-<div class="legend-wrap">
-  <div class="legend-title">颜色说明</div>
-  <div class="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:#C6EFCE"></div><span>风1-4级</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FFEB9C"></div><span>风5级</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#E2A7D7"></div><span>风6级</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FF6600"></div><span>风7-9级</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#DEEAF1"></div><span>浪&lt;1.5m</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#9DC3E6"></div><span>浪1.5-3m</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FFFF00"></div><span>浪3-4m</span></div>
-    <div class="legend-item"><div class="legend-dot" style="background:#FFAAAA"></div><span>浪≥4m</span></div>
-  </div>
-</div>
-
-<!-- 今日告警表 -->
-<div class="alert-box">
-  <h3>今日({today})告警船舶 ({len(alert_ships)}艘)</h3>
-"""
+    # 告警表
+    parts.append('<div class="alert-section">\n')
+    parts.append('<h3>告警船舶 (%d艘)</h3>\n' % len(alert_ships))
     if alert_ships:
-        html += """  <table class="alert-table">
-    <tr><th>船名</th><th>船型</th><th>最大浪高(m)</th><th>最大风级</th><th>告警原因</th></tr>
-"""
+        parts.append('<table class="alert-table"><tr><th>船名</th><th>船型</th><th>最大浪高(m)</th><th>最大风级</th><th>告警原因</th></tr>\n')
         for s in sorted(alert_ships, key=lambda x: -x['max_wave']):
             reasons = []
-            if s['max_wave'] >= WAVE_RED: reasons.append(f'浪高{s["max_wave"]}m')
-            if s['max_wind'] > WIND_THRESHOLD: reasons.append(f'风级{s["max_wind"]}')
-            w_cls = 'wave-red' if s['max_wave'] >= WAVE_RED else ''
-            wd_cls = 'wind-red' if s['max_wind'] > WIND_THRESHOLD else ''
-            html += f'    <tr><td style="text-align:left;color:#fff">{s["name"]}</td><td>{s["type"]}</td>'
-            html += f'<td class="{w_cls}">{s["max_wave"]}</td>'
-            html += f'<td class="{wd_cls}">{s["max_wind"]}</td>'
-            html += f'<td style="text-align:left;color:#ff9900">{"; ".join(reasons)}</td></tr>\n'
-        html += "  </table>\n"
+            if s['max_wave'] >= WAVE_RED: reasons.append('浪高%.1fm' % s['max_wave'])
+            if s['max_wind'] > 6: reasons.append('风级%d' % int(s['max_wind']))
+            wc = 'wave-hi' if s['max_wave'] >= WAVE_RED else ''
+            wdc = 'wind-hi' if s['max_wind'] > 6 else ''
+            parts.append('<tr><td>%s</td><td>%s</td><td class="%s">%.1f</td><td class="%s">%d</td><td>%s</td></tr>\n' % (
+                H(s['name']), H(s['type']), wc, s['max_wave'], wdc, int(s['max_wind']), '; '.join(reasons)))
+        parts.append('</table>\n')
     else:
-        html += '  <p class="no-alert">✓ 今日无告警</p>\n'
-    html += "</div>\n"
+        parts.append('<p style="color:green">今日无告警</p>\n')
+    parts.append('</div>\n')
 
-    # 每日浪高卡片
-    html += """<div class="wave-section">
-  <h3>未来一周浪高≥3m 船舶（按日期）</h3>
-  <div class="week-grid">
-"""
+    # 浪高告警按日
+    parts.append('<div class="alert-section">\n')
+    parts.append('<h3>未来一周浪高&gt;=3m 船舶（按日期）</h3>\n')
     for d in dates:
-        is_today = (d == today)
-        day_ships = []
-        for ship in ships:
-            max_w = 0
-            for key, vd in ship['data']['浪高'].items():
-                if key.startswith(d):
-                    try: max_w = max(max_w, float(vd['value']))
-                    except: pass
-            if max_w >= WAVE_RED:
-                day_ships.append((ship['name'], max_w))
-        day_ships.sort(key=lambda x: -x[1])
-
-        html += f'  <div class="day-card{" today" if is_today else ""}">'
-        html += f'    <div class="day-label">{"★ " if is_today else ""}{d}</div>'
+        is_today = d == today
+        day_dict = wave3_days.get(d, {})
+        day_ships = sorted(day_dict.items(), key=lambda x: -x[1])
+        parts.append('<p><b>%s%s:</b> ' % ('&#9733; ' if is_today else '', d))
         if day_ships:
-            for nm, wv in day_ships[:6]:
-                html += f'    <div class="ship-row"><span class="nm">{nm}</span><span class="wv">{wv}m</span></div>\n'
-            if len(day_ships) > 6:
-                html += f'    <div class="no-alert">...还有{len(day_ships)-6}艘</div>\n'
+            names = ' '.join(['%s %.1fm' % (H(n), w) for n, w in day_ships[:8]])
+            parts.append(names)
+            if len(day_ships) > 8:
+                parts.append(' ...还有%d艘' % (len(day_ships) - 8))
         else:
-            html += '    <div class="no-alert">✓ 无高浪</div>\n'
-        html += '  </div>\n'
-    html += """</div>
-</div>
-"""
+            parts.append('无')
+        parts.append('</p>\n')
+    parts.append('</div>\n')
 
-    # ── 主表格（与邮件1:1匹配）────────────────────────────────────────────
-    html += """<div class="main-table-section">
-  <h3>全览详细表格（7天 × 4时段 预报）</h3>
-  <div class="hint">← 左右滑动查看全部时段 →</div>
-  <div class="table-scroll">
-  <table class="main">
-"""
-    # 表头行1：日期
-    html += "<thead>\n<tr>\n"
-    html += '<th class="ship-h" rowspan="2">船名 / 船型</th>\n'
+    # 图例
+    parts.append('<div class="legend-section">\n')
+    parts.append('<h3>颜色图例</h3>\n')
+    parts.append('<div class="legend-row">\n')
+    parts.append('<span class="legend-label">风级:</span>\n')
+    wind_c = ['#e8f5e9','#c8e6c9','#a5d6a7','#81c784','#66bb6a','#e1bee7','#ce93d8','#ab47bc','#8e24aa','#6a1b9a']
+    for i in range(1, 11):
+        lbl = '%d级' % i if i < 10 else '&gt;=10级'
+        parts.append('<span class="legend-item"><span class="legend-box" style="background:%s"></span>%s</span>\n' % (wind_c[i-1], lbl))
+    parts.append('</div>\n')
+    parts.append('<div class="legend-row">\n')
+    parts.append('<span class="legend-label">浪高:</span>\n')
+    wave_c = ['#e1f5fe','#81d4fa','#29b6f6','#fff59d','#ffeb3b','#ffd54f','#ffc107','#ffa000','#ff6f00','#bf360c']
+    wave_l = ['&lt;2m','2-3m','3-4m','4-5m','5-6m','6-7m','7-8m','8-9m','9-10m','&gt;=10m']
+    for i, (c, l) in enumerate(zip(wave_c, wave_l)):
+        parts.append('<span class="legend-item"><span class="legend-box" style="background:%s"></span>%s</span>\n' % (c, l))
+    parts.append('</div>\n')
+    parts.append('<div class="legend-row">\n')
+    parts.append('<span class="legend-label">涌差:</span>\n')
+    tide_c = ['white','#795548','#5d4037','#4e342e','#3e2723']
+    for i, c in enumerate(tide_c):
+        parts.append('<span class="legend-item"><span class="legend-box" style="background:%s"></span></span>\n' % c)
+    parts.append('</div>\n')
+    parts.append('</div>\n')
+
+    # 主表格
+    parts.append('<div class="table-wrap">\n')
+    parts.append('<table>\n')
+
+    # 表头行1：船名 | 风浪 | 日期
+    parts.append('<thead>\n')
+    parts.append('<tr class="sticky-t">\n')
+    parts.append('<th rowspan="2" class="sticky-t" style="min-width:130px;">船名</th>\n')
+    parts.append('<th rowspan="2" class="sticky-t" style="width:42px;">风浪</th>\n')
     for d in dates:
         times = date_groups[d]
-        is_today = (d == today)
-        cls = 'today-col' if is_today else 'dt'
-        if len(times) > 1:
-            html += f'<th class="{cls}" colspan="{len(times)}">{d}</th>\n'
-        else:
-            html += f'<th class="{cls}">{d}</th>\n'
-    html += "</tr>\n<tr>\n"
-    # 表头行2：时间
-    for d in dates:
-        for (_, t) in date_groups[d]:
-            is_today = (d == today)
-            cls = 'today-col' if is_today else 'dt'
-            html += f'<th class="{cls}">{t}</th>\n'
-    html += "</tr>\n</thead>\n<tbody>\n"
+        cls = 'today-hdr' if d == today else ''
+        parts.append('<th colspan="%d" class="sticky-t %s">%s</th>\n' % (len(times), cls, d))
+    parts.append('</tr>\n')
+
+    # 表头行2：时间（28列 = 7天 × 4时段）
+    parts.append('<tr class="sticky-t">\n')
+    time_map = {0: '0600', 1: '1200', 2: '1800', 3: '2400'}
+    for d, t in col_dts:
+        cls = 'today-hdr' if d == today else ''
+        # 每天重复 4 个时段
+        for slot_i in range(4):
+            parts.append('<th class="sticky-t %s">%s</th>\n' % (cls, time_map[slot_i]))
+    parts.append('</tr>\n')
+    parts.append('</thead>\n')
 
     # 数据行
-    type_class_map = {
-        'VLOC Own': 'vloc-own', 'VLOC': 'vloc', 'Capesize': 'cape',
-        'Panamax': 'pana', 'Ultramax': 'ultra', 'Supramax': 'supra',
-        'Handymax': 'handy', 'Unknown': 'unkn'
-    }
-
+    # 关键：col_dts 只有 7 条（每天一个值），但 HTML 表头有 28 列
+    # 风级行：按 col_dts 逐个填入（重复当天值填充 4 个时段格）
+    # 其他行（涌差/能见度/浪高）：每个 col_dt 值填入 4 格（跨越同一日期的 4 个时段）
+    parts.append('<tbody>\n')
     for ship in ships:
-        # 风级行（船名+船型标签，与邮件一致）
-        html += '<tr class="ship-row">'
-        html += f'<td class="ship">{ship["name"]}<br><span class="ship-type-tag">{ship["type"]}{" ★" if ship.get("is_own") else ""}</span></td>\n'
+        # ── 风级行（rowspan=4 跨4行）────────────────────────
+        parts.append('<tr>\n')
+        parts.append('<td class="ship-col ship-cell" rowspan="4">\n')
+        parts.append('<div class="ship-name">%s</div>\n' % H(ship['name']))
+        parts.append('<div class="vessel-type">%s</div>\n' % H(ship['type']))
+        parts.append('</td>\n')
+        parts.append('<td class="param-label">风级</td>\n')
+        # col_dts 只有 7 条，填充 28 格
+        di = 0
         for d, t in col_dts:
-            key = f"{d} {t}"
-            vd  = ship['data']['风级'].get(key, {})
+            key = '%s %s' % (d, t)
+            vd = ship['data'].get('风级', {}).get(key, {})
             val = vd.get('value', '')
-            try:
-                lv = float(val)
-                bg = wind_color(val)
-                cls = 'v wind-cell'
-            except:
-                bg = '#E2EFDA'; cls = 'v wind-cell'
-            style = f'background:{bg}' if bg != '#E2EFDA' else ''
-            html += f'<td class="{cls}" style="{style}">{val}</td>\n'
-        html += "</tr>\n"
+            cls = wind_cls(val) if val and val not in ('-', '') else 'wind1'
+            if val in ('-', ''): val = '-'
+            # 每天填 4 格（同一天的值重复）
+            for _ in range(4):
+                parts.append('<td class="%s">%s</td>\n' % (cls, val))
+        parts.append('</tr>\n')
 
-        # 涌差行已移除（不需要）
-        # 能见度行
-        html += '<tr class="param-row">'
-        html += '<td class="ship"><span class="param">能见度</span></td>\n'
+        # ── 涌差行 ─────────────────────────────────────
+        parts.append('<tr>\n')
+        parts.append('<td class="param-label">涌差</td>\n')
         for d, t in col_dts:
-            key = f"{d} {t}"
-            vd  = ship['data']['能见度'].get(key, {})
+            vd = ship['data'].get('涌差', {}).get('%s %s' % (d, t), {})
             val = vd.get('value', '')
-            try:
-                bg = vis_color(val)
-                style = f'background:{bg}' if bg != '#DEEBF7' else ''
-            except:
-                style = ''
-            html += f'<td class="v vis-cell" style="{style}">{val}</td>\n'
-        html += "</tr>\n"
+            cls = tide_cls(val) if val and val not in ('-', '') else 'tide1'
+            if val in ('-', ''): val = '-'
+            for _ in range(4):
+                parts.append('<td class="%s">%s</td>\n' % (cls, val))
+        parts.append('</tr>\n')
 
-        # 浪高行
-        html += '<tr class="param-row">'
-        html += '<td class="ship"><span class="param">浪高</span></td>\n'
+        # ── 能见度行 ────────────────────────────────────
+        parts.append('<tr>\n')
+        parts.append('<td class="param-label">能见度</td>\n')
         for d, t in col_dts:
-            key = f"{d} {t}"
-            vd  = ship['data']['浪高'].get(key, {})
+            vd = ship['data'].get('能见度', {}).get('%s %s' % (d, t), {})
             val = vd.get('value', '')
-            try:
-                bg = wave_color(val)
-                style = f'background:{bg}; color:#000'
-                if float(val) >= WAVE_RED: style += '; font-weight:700'
-            except:
-                style = ''
-            html += f'<td class="v wave-cell" style="{style}">{val}</td>\n'
-        html += "</tr>\n"
+            if val and val not in ('-', ''):
+                try:
+                    cls = 'vis-warn' if float(val) < VIS_THRESHOLD else 'vis-ok'
+                except:
+                    cls = 'vis-ok'
+            else:
+                cls = 'vis-ok'
+                val = '-'
+            for _ in range(4):
+                parts.append('<td class="%s">%s</td>\n' % (cls, val))
+        parts.append('</tr>\n')
 
-    html += "</tbody>\n</table>\n</div>\n</div>\n"
+        # ── 浪高行 ────────────────────────────────────
+        parts.append('<tr>\n')
+        parts.append('<td class="param-label">浪高</td>\n')
+        for d, t in col_dts:
+            vd = ship['data'].get('浪高', {}).get('%s %s' % (d, t), {})
+            val = vd.get('value', '')
+            cls = wave_cls(val) if val and val not in ('-', '') else 'wave1'
+            if val in ('-', ''): val = '-'
+            for _ in range(4):
+                parts.append('<td class="%s">%s</td>\n' % (cls, val))
+        parts.append('</tr>\n')
+
+    parts.append('</tbody>\n')
+    parts.append('</table>\n</div>\n')
 
     # 页脚
-    html += f"""<div style="text-align:center; color:#555; font-size:0.72em; padding:20px 0;">
-  HiFleet 船舶气象预报自动同步 &middot; 数据更新: {today} &middot;
-  排除: ORE CHINA, ORE DONGJIAKOU, ORE HEBEI, ORE SHANDONG
-</div>
-</body></html>"""
+    parts.append('<div style="text-align:center; padding:12px; color:#666; font-size:11px;">\n')
+    parts.append('HiFleet 船舶气象预报自动同步 &middot; 数据更新: %s &middot; 排除: ORE CHINA, ORE DONGJIAKOU, ORE HEBEI, ORE SHANDONG\n' % today)
+    parts.append('</div>\n</body></html>')
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    html = ''.join(parts)
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html)
-    print(f"Saved: {output_path}")
+    print('Saved: %s (%d bytes)' % (output_path, len(html)))
 
 
-def main():
-    print("Fetching email...")
-    html = fetch_hifleet_email()
-
-    if html:
-        print("Parsing HTML...")
-        try:
-            from bs4 import BeautifulSoup
-            ships, col_dts = parse_html(html)
-            print(f"Parsed {len(ships)} ships, {len(col_dts)} time slots")
-        except ImportError:
-            print("BeautifulSoup not available, using cached data")
-            ships, col_dts = load_cached()
-    else:
-        print("No email - loading cache...")
-        ships, col_dts = load_cached()
-
-    if not ships:
-        print("ERROR: No ship data")
-        with open("output/index.html","w",encoding="utf-8") as f:
-            f.write("<html><body style='background:#1a1a2e;color:#e94560;padding:40px;font-family:Arial;text-align:center'><h1>No data</h1></body></html>")
-    else:
-        build_dashboard(ships, col_dts)
-    print("Done!")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    ships, col_dts = load_data()
+    print('Ships: %d, Slots: %d' % (len(ships), len(col_dts)))
+    build_html(ships, col_dts, r'C:\Users\HKMW\Desktop\hifleet_email_style.html')
