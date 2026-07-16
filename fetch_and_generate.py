@@ -315,11 +315,12 @@ def build_html(ships, col_dts, output_path):
 
     # Body: 4 rows per ship
     parts.append("<tbody>\n")
+    # 注意: JSON 中的 key 是中文，不要改成英文!
     param_rows = [
-        ("风级", "wind", wind_cls),
-        ("潮差", "tide", tide_cls),
-        ("能见度", "vis", lambda v: "vis-warn" if (try_float(v) < VIS_THRESH) else "vis-ok"),
-        ("浪高", "wave", wave_cls),
+        ("风级",   "风级",   wind_cls),
+        ("涌差",   "涌差",   tide_cls),
+        ("能见度", "能见度", lambda v: "vis-warn" if (try_float(v) < VIS_THRESH) else "vis-ok"),
+        ("浪高",   "浪高",   wave_cls),
     ]
     for ship in ships:
         # Build 4 rows, each with ship-name cell (rowspan=4) + param label + 28 data cells
